@@ -34,7 +34,7 @@ namespace Salakhova_Sharp
         private bool _isConnected;
         private int _clientId = -1;
         private Thread _readerThread;
-        private Timer _pingTimer;
+        private System.Threading.Timer _pingTimer;
 
         private readonly object _writeLock = new object();
         private readonly object _inboxLock = new object();
@@ -105,7 +105,7 @@ namespace Salakhova_Sharp
                 _readerThread.Start();
 
                 // Запускаем keep-alive пинг (MT_INFO каждые 10 сек)
-                _pingTimer = new Timer(PingCallback, null,
+                _pingTimer = new System.Threading.Timer(PingCallback, null,
                     MessageConstants.PingIntervalMs, MessageConstants.PingIntervalMs);
 
                 // Ждём получения clientId через MT_CONFIRM (до 5 сек).
