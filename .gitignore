@@ -1,0 +1,30 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/x64/
+**/Debug/
+**/Release/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.tlog/
+*.cache
+*.recipe
+*.log
+*.idb
+*.lastbuildstate
+*.FileListAbsolute.txt
+
+# IDE
+.vs/
+*.user
+*.suo
+*.vcxproj.filters
+
+# Python
+__pycache__/
+*.pyc
