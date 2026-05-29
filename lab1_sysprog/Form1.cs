@@ -13,10 +13,7 @@ namespace Salakhova_Sharp
         private System.Windows.Forms.Timer pingTimer;
         private string clientName = "Client";
 
-        // Константы протокола твоего сервера
-        const int MT_DATA = 1;
-        const int MT_QUIT = 4;
-        const int MT_INFO = 5;
+
 
         public Form1()
         {
@@ -77,8 +74,8 @@ namespace Salakhova_Sharp
 
             int targetId = ((RecipientItem)comboRecipient.SelectedItem).Id;
 
-            // Отправляем текстовые данные (MT_DATA = 1 в твоем перечислении enum)
-            netClient.Send(targetId, (MessageTypes)MT_DATA, textBoxMessage.Text);
+            // Отправляем текстовые данные
+            netClient.Send(targetId, MessageTypes.MT_DATA, textBoxMessage.Text);
 
             txtOutput.AppendText($"[You -> {comboRecipient.SelectedItem}]: {textBoxMessage.Text}\r\n");
             textBoxMessage.Clear();
@@ -88,8 +85,8 @@ namespace Salakhova_Sharp
         {
             if (netClient.IsConnected)
             {
-                // Отправляем пинг-сообщение (MT_INFO = 5) на сервер (target = -2)
-                netClient.Send(-2, (MessageTypes)MT_INFO, "");
+                // Отправляем пинг-сообщение (MT_INFO) на сервер
+                netClient.Send(MessageConstants.ADDR_SERVER, MessageTypes.MT_INFO, "");
             }
         }
 
@@ -104,17 +101,19 @@ namespace Salakhova_Sharp
 
             while (netClient.Poll(out srcId, out type, out text))
             {
-                // Если тип сообщения равен 6 (MT_CONFIRM) — пришел список клиентов
-                if ((int)type == 6)
+                // Если тип сообщения MT_CONFIRM — пришел список клиентов
+                if (type == MessageTypes.MT_CONFIRM)
                 {
                     ParseClientList(text);
                 }
-                // Если тип сообщения равен 1 (MT_DATA) — это обычный текст от другого клиента
-                else if ((int)type == 1)
+                // Если тип сообщения MT_DATA — это обычный текст от другого клиента
+                else if (type == MessageTypes.MT_DATA)
                 {
                     txtOutput.AppendText($"[From Client #{srcId}]: {text}\r\n");
                 }
             }
+
+            // GETDATA отправляется внутри netClient.Poll() автоматически
 
             // Проверяем статус сетевого подключения
             if (!netClient.IsConnected)

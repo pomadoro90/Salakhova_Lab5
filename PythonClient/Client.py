@@ -1,65 +1,102 @@
-import threading
+import sys
 import time
-from Message import *
+import threading
+from datetime import datetime
+from Message import SalakhovaClient, parse_client_list
 
 
-def ProcessMessages():
-    while True:
-        m = Message()
-        # Поток бесконечно ждет новых данных от сервера
-        m.Receive(Message.Connection)
+def main():
+    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 12345
+    name = sys.argv[3] if len(sys.argv) > 3 else "PyClient"
 
-        if m.Header.Type == MT_DATA:
-            print(f"\n[Клиент #{m.Header.From}]: {m.Data}")
-            print("> ", end="", flush=True)
-
-        elif m.Header.Type == MT_CONFIRM:
-            # Сервер присылает Broadcast со списком при любом изменении.
-            # Мы можем использовать первое такое сообщение, чтобы узнать свой ID,
-            # так как сервер отправляет его в поле From или To.
-            if Message.ClientID == 0:
-                print("\n[Система] Успешное подключение к серверу сообщений.")
-                print("> ", end="", flush=True)
-                # Просто ставим флаг, что мы подключены
-                Message.ClientID = -1
-
-        elif m.Header.Type == MT_CLOSE:
-            print("\n[Система] Соединение с сервером разорвано.")
-            break
-
-
-def Client():
+    client = SalakhovaClient()
     try:
-        Message.Connect('127.0.0.1', 12345)
+        client.connect(host, port, name)
     except Exception as e:
-        print(f"Ошибка подключения: {e}")
-        return
+        print(f"[ERROR] Connection failed: {e}")
+        sys.exit(1)
 
-    # Отправляем пустое MT_INFO (пинг), чтобы сервер нас зарегистрировал
-    # и прислал в ответ MT_CONFIRM
-    Message.SendMessage(MR_BROKER, MT_INFO, "")
+    print(f"Connected as Client #{client.client_id}")
 
-    # Запускаем чтение входящих сообщений в отдельном фоновом потоке
-    t = threading.Thread(target=ProcessMessages, daemon=True)
-    t.start()
+    running = True
 
-    print("Введи сообщение (или /quit для выхода):")
+    def printer_loop():
+        nonlocal running
+        while running and client.alive:
+            msg = client.poll()
+            if msg:
+                from_id, msg_type, to, payload = msg
+                if msg_type == client.MT_DATA:
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    print(f"\n[{ts}] Client #{from_id}: {payload}")
+                    print("> ", end="", flush=True)
+                elif msg_type == client.MT_CONFIRM:
+                    client.clients = parse_client_list(payload)
+            else:
+                time.sleep(0.01)
 
-    while True:
-        try:
-            text = input("> ")
-        except (KeyboardInterrupt, EOFError):
-            break
+    def poller_loop():
+        nonlocal running
+        while running and client.alive:
+            try:
+                client._send_message(client.client_id, client.MT_GETDATA)
+            except:
+                pass
+            time.sleep(0.05)
 
-        if text == "/quit":
-            Message.SendMessage(MR_BROKER, MT_QUIT)
-            time.sleep(0.5)  # Даем время на отправку перед закрытием
-            break
+    def ping_loop():
+        nonlocal running
+        while running and client.alive:
+            try:
+                client._send_message(client.ADDR_SERVER, client.MT_INFO)
+            except:
+                pass
+            time.sleep(10)
 
-        if text.strip() != "":
-            # По умолчанию шлем широковещательное сообщение всем (MR_ALL)
-            Message.SendMessage(MR_ALL, MT_DATA, text)
+    threading.Thread(target=printer_loop, daemon=True).start()
+    threading.Thread(target=poller_loop, daemon=True).start()
+    threading.Thread(target=ping_loop, daemon=True).start()
+
+    print("Commands: /list, /send <id|all> <text>, /quit")
+    try:
+        while running and client.alive:
+            try:
+                line = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line:
+                continue
+            if line == "/quit":
+                break
+            elif line == "/list":
+                if client.clients:
+                    for cid, cname in client.clients.items():
+                        marker = " (you)" if cid == client.client_id else ""
+                        print(f"  #{cid}: {cname}{marker}")
+                else:
+                    print("  (no clients)")
+            elif line.startswith("/send "):
+                rest = line[6:].strip()
+                parts = rest.split(' ', 1)
+                if len(parts) < 2 or not parts[1]:
+                    print("Usage: /send <id|all> <text>")
+                    continue
+                target = parts[0]
+                text = parts[1]
+                try:
+                    target_id = client.ADDR_BROADCAST if target == "all" else int(target)
+                    client._send_message(target_id, client.MT_DATA, text)
+                except (ValueError, Exception) as e:
+                    print(f"[ERROR] {e}")
+            else:
+                print("Unknown command. Use /list, /send <id|all> <text>, /quit")
+    finally:
+        running = False
+        client.disconnect()
+        time.sleep(0.1)
 
 
 if __name__ == '__main__':
-    Client()
+    main()

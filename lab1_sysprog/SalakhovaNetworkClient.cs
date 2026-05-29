@@ -1,14 +1,12 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
 namespace Salakhova_Sharp
 {
-    // Перечисления типов сообщений из файлов преподавателя
     public enum MessageTypes : int
     {
         MT_INIT = 0,
@@ -16,16 +14,18 @@ namespace Salakhova_Sharp
         MT_GETDATA = 2,
         MT_DATA = 3,
         MT_NODATA = 4,
-        MT_CONFIRM = 6 // В твоем сервере MT_CONFIRM равен 6
+        MT_INFO = 5,
+        MT_CONFIRM = 6,
+        MT_CLOSE = 7,
+        MT_QUIT = 8
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public struct MessageHeader
+    public static class MessageConstants
     {
-        [MarshalAs(UnmanagedType.I4)] public MessageTypes type;
-        [MarshalAs(UnmanagedType.I4)] public int size;
-        [MarshalAs(UnmanagedType.I4)] public int to;
-        [MarshalAs(UnmanagedType.I4)] public int from;
+        public const int ADDR_BROADCAST = -1;
+        public const int ADDR_SERVER = -2;
+        public const int HeaderSize = 16;
+        public const int PingIntervalMs = 10000;
     }
 
     public class SalakhovaNetworkClient
@@ -34,6 +34,7 @@ namespace Salakhova_Sharp
         private bool _isConnected;
         private int _clientId = -1;
         private Thread _readerThread;
+        private Timer _pingTimer;
 
         private readonly object _writeLock = new object();
         private readonly object _inboxLock = new object();
@@ -45,27 +46,29 @@ namespace Salakhova_Sharp
         public bool IsConnected => _isConnected;
         public int ClientId => _clientId;
 
-        // Помощники преподавателя для работы с бинарными структурами
-        private static byte[] StructureToBytes(object obj)
+        // ── Сериализация ────────────────────────────────────────────────
+
+        private static byte[] PackHeader(int messageType, int size, int to, int from)
         {
-            int size = Marshal.SizeOf(obj);
-            byte[] buff = new byte[size];
-            IntPtr ptr = Marshal.AllocHGlobal(size);
-            Marshal.StructureToPtr(obj, ptr, true);
-            Marshal.Copy(ptr, buff, 0, size);
-            Marshal.FreeHGlobal(ptr);
-            return buff;
+            byte[] buf = new byte[MessageConstants.HeaderSize];
+            Buffer.BlockCopy(BitConverter.GetBytes(messageType), 0, buf, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(size), 0, buf, 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(to), 0, buf, 8, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(from), 0, buf, 12, 4);
+            return buf;
         }
 
-        private static T BytesToStructure<T>(byte[] buff) where T : struct
+        private static (int messageType, int size, int to, int from) UnpackHeader(byte[] buf)
         {
-            int size = Marshal.SizeOf(typeof(T));
-            IntPtr ptr = Marshal.AllocHGlobal(size);
-            Marshal.Copy(buff, 0, ptr, size);
-            T obj = (T)Marshal.PtrToStructure(ptr, typeof(T));
-            Marshal.FreeHGlobal(ptr);
-            return obj;
+            return (
+                BitConverter.ToInt32(buf, 0),
+                BitConverter.ToInt32(buf, 4),
+                BitConverter.ToInt32(buf, 8),
+                BitConverter.ToInt32(buf, 12)
+            );
         }
+
+        // ── Connect ──────────────────────────────────────────────────────
 
         public bool Connect(string host, int port, string clientName)
         {
@@ -76,29 +79,57 @@ namespace Salakhova_Sharp
                 _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 _socket.Connect(new IPEndPoint(IPAddress.Parse(host), port));
 
-                // 1. Отправляем MT_INIT на сервер (to = -2 (Broker), size = длина строки * 2)
-                byte[] payload = Encoding.Unicode.GetBytes(clientName);
-                MessageHeader header = new MessageHeader
-                {
-                    type = MessageTypes.MT_INIT,
-                    size = payload.Length,
-                    to = -2,
-                    from = 0
-                };
+                // Сервер Салаховой автоматически создаёт сессию при подключении.
+                // Отправляем MT_INIT, чтобы сервер знал имя клиента.
+                byte[] payload = Encoding.Unicode.GetBytes(clientName ?? "");
+                byte[] header = PackHeader(
+                    (int)MessageTypes.MT_INIT,
+                    payload.Length,
+                    MessageConstants.ADDR_SERVER,
+                    0
+                );
 
-                _socket.Send(StructureToBytes(header));
-                if (payload.Length > 0)
+                lock (_writeLock)
                 {
-                    _socket.Send(payload);
+                    _socket.Send(header);
+                    if (payload.Length > 0)
+                    {
+                        _socket.Send(payload);
+                    }
                 }
 
-                // В твоем сервере при подключении clientId выдается автоматически,
-                // а список клиентов рассылается широковещательно (Broadcast) как MT_CONFIRM.
                 _isConnected = true;
 
-                // 2. Запускаем фоновый поток чтения сокета
+                // Запускаем фоновый поток чтения
                 _readerThread = new Thread(ReaderLoop) { IsBackground = true };
                 _readerThread.Start();
+
+                // Запускаем keep-alive пинг (MT_INFO каждые 10 сек)
+                _pingTimer = new Timer(PingCallback, null,
+                    MessageConstants.PingIntervalMs, MessageConstants.PingIntervalMs);
+
+                // Ждём получения clientId через MT_CONFIRM (до 5 сек).
+                // Сервер кладёт подтверждение в очередь сессии,
+                // читаем его через GETDATA polling.
+                _clientId = -1;
+                DateTime deadline = DateTime.Now.AddSeconds(5);
+                while (_clientId == -1 && DateTime.Now < deadline)
+                {
+                    // Шлём GETDATA чтобы сервер переслал сообщения из очереди
+                    SendInternal(MessageConstants.ADDR_SERVER, MessageTypes.MT_GETDATA, "");
+
+                    // Проверяем inbox
+                    TryDrainClientId();
+
+                    if (_clientId == -1)
+                        Thread.Sleep(50);
+                }
+
+                if (_clientId == -1)
+                {
+                    // Не получили ID — всё равно продолжаем, ID не обязателен для работы
+                    _clientId = 0;
+                }
 
                 return true;
             }
@@ -109,19 +140,60 @@ namespace Salakhova_Sharp
             }
         }
 
+        /// <summary>
+        /// Проверяет inbox на наличие MT_CONFIRM с clientId.
+        /// Сервер шлёт MT_CONFIRM с текстом = строковое представление ID.
+        /// </summary>
+        private void TryDrainClientId()
+        {
+            lock (_inboxLock)
+            {
+                var keep = new Queue<(int, MessageTypes, string)>();
+                while (_inbox.Count > 0)
+                {
+                    var msg = _inbox.Dequeue();
+                    if (msg.type == MessageTypes.MT_CONFIRM && _clientId == -1)
+                    {
+                        // Первое MT_CONFIRM содержит наш ID как число
+                        if (int.TryParse(msg.text, out int id) && id > 0)
+                        {
+                            _clientId = id;
+                        }
+                        else
+                        {
+                            keep.Enqueue(msg); // Это клиент-лист, не ID
+                        }
+                    }
+                    else
+                    {
+                        keep.Enqueue(msg);
+                    }
+                }
+                // Вернуть невостребованные сообщения обратно
+                while (keep.Count > 0)
+                {
+                    _inbox.Enqueue(keep.Dequeue());
+                }
+            }
+        }
+
+        // ── Disconnect ──────────────────────────────────────────────────────
+
         public void Disconnect()
         {
-            if (!_isConnected) return;
+            _isConnected = false;
+
+            if (_pingTimer != null)
+            {
+                try { _pingTimer.Dispose(); } catch { }
+                _pingTimer = null;
+            }
 
             try
             {
-                // Отправляем MT_QUIT (в твоей системе это тип сообщения для выхода)
-                // Или MT_EXIT из перечисления преподавателя. По коду твоего сервера обрабатывается MT_QUIT (4).
-                Send(-2, (MessageTypes)4, "");
+                SendInternal(MessageConstants.ADDR_SERVER, MessageTypes.MT_QUIT, "");
             }
             catch { }
-
-            _isConnected = false;
 
             if (_socket != null)
             {
@@ -133,29 +205,14 @@ namespace Salakhova_Sharp
             _readerThread = null;
         }
 
-        public void Send(int targetId, MessageTypes type, string text)
+        // ── Send ──────────────────────────────────────────────────────────
+
+        public void Send(int to, MessageTypes messageType, string text)
         {
             if (!_isConnected || _socket == null) return;
-
             try
             {
-                byte[] payload = Encoding.Unicode.GetBytes(text ?? "");
-                MessageHeader header = new MessageHeader
-                {
-                    type = type,
-                    size = payload.Length,
-                    to = targetId,
-                    from = _clientId
-                };
-
-                lock (_writeLock)
-                {
-                    _socket.Send(StructureToBytes(header));
-                    if (payload.Length > 0)
-                    {
-                        _socket.Send(payload);
-                    }
-                }
+                SendInternal(to, messageType, text);
             }
             catch
             {
@@ -163,9 +220,44 @@ namespace Salakhova_Sharp
             }
         }
 
-        // Метод извлечения данных из локальной очереди (внутренний пуллинг формы)
+        private void SendInternal(int to, MessageTypes messageType, string text)
+        {
+            byte[] payload = Encoding.Unicode.GetBytes(text ?? "");
+            byte[] header = PackHeader(
+                (int)messageType,
+                payload.Length,
+                to,
+                _clientId > 0 ? _clientId : 0
+            );
+
+            lock (_writeLock)
+            {
+                _socket.Send(header);
+                if (payload.Length > 0)
+                {
+                    _socket.Send(payload);
+                }
+            }
+        }
+
+        // ── Poll ────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Достаёт одно сообщение из inbox (неблокирующий).
+        /// Автоматически шлёт MT_GETDATA для запроса новых данных.
+        /// </summary>
         public bool Poll(out int fromId, out MessageTypes type, out string text)
         {
+            // Отправляем GETDATA чтобы сервер переслал накопленные сообщения
+            if (_isConnected)
+            {
+                try
+                {
+                    SendInternal(MessageConstants.ADDR_SERVER, MessageTypes.MT_GETDATA, "");
+                }
+                catch { }
+            }
+
             lock (_inboxLock)
             {
                 if (_inbox.Count > 0)
@@ -177,51 +269,60 @@ namespace Salakhova_Sharp
                     return true;
                 }
             }
+
             fromId = 0;
             type = MessageTypes.MT_NODATA;
             text = null;
             return false;
         }
 
+        // ── Reader loop (background thread) ─────────────────────────────────
+
         private void ReaderLoop()
         {
-            int headerSize = Marshal.SizeOf(typeof(MessageHeader));
-            byte[] headerBuffer = new byte[headerSize];
+            byte[] headerBuffer = new byte[MessageConstants.HeaderSize];
 
             while (_isConnected)
             {
                 try
                 {
-                    // Читаем заголовок строго полностью
-                    int readBytes = ReadExact(headerBuffer, headerSize);
-                    if (readBytes == 0) break;
+                    int read = ReadExact(headerBuffer, MessageConstants.HeaderSize);
+                    if (read == 0) break;
 
-                    MessageHeader header = BytesToStructure<MessageHeader>(headerBuffer);
+                    var (msgType, dataSize, msgTo, msgFrom) = UnpackHeader(headerBuffer);
 
-                    // Если сервер прислал нам подтверждение ID (например, при MT_INIT)
-                    if (header.type == MessageTypes.MT_INIT)
+                    // Получили ID — сохраним
+                    if ((MessageTypes)msgType == MessageTypes.MT_CONFIRM && _clientId == -1)
                     {
-                        _clientId = header.to; // Сервер записывает выданный ID в поле 'to'
+                        // Будет обработан в TryDrainClientId
                     }
 
-                    // Если пришло уведомление о том, что сообщений на сервере больше нет
-                    if (header.type == MessageTypes.MT_NODATA)
+                    // Пропускаем пустые ответы (MT_NODATA)
+                    if ((MessageTypes)msgType == MessageTypes.MT_NODATA)
                     {
                         continue;
                     }
 
-                    string text = "";
-                    if (header.size > 0)
+                    // Сервер закрывает соединение
+                    if ((MessageTypes)msgType == MessageTypes.MT_CLOSE)
                     {
-                        byte[] payloadBuffer = new byte[header.size];
-                        ReadExact(payloadBuffer, header.size);
+                        _isConnected = false;
+                        break;
+                    }
+
+                    // Читаем payload если есть
+                    string text = "";
+                    if (dataSize > 0)
+                    {
+                        byte[] payloadBuffer = new byte[dataSize];
+                        ReadExact(payloadBuffer, dataSize);
                         text = Encoding.Unicode.GetString(payloadBuffer);
                     }
 
-                    // Добавляем сообщение во внутреннюю потокобезопасную очередь
+                    // Добавляем во входящую очередь
                     lock (_inboxLock)
                     {
-                        _inbox.Enqueue((header.from, header.type, text));
+                        _inbox.Enqueue((msgFrom, (MessageTypes)msgType, text));
                     }
                 }
                 catch
@@ -230,8 +331,25 @@ namespace Salakhova_Sharp
                     break;
                 }
             }
+
             _isConnected = false;
         }
+
+        // ── Keep-alive ping ─────────────────────────────────────────────────
+
+        private void PingCallback(object state)
+        {
+            if (_isConnected)
+            {
+                try
+                {
+                    SendInternal(MessageConstants.ADDR_SERVER, MessageTypes.MT_INFO, "");
+                }
+                catch { }
+            }
+        }
+
+        // ── Helper: read exact N bytes ──────────────────────────────────────
 
         private int ReadExact(byte[] buffer, int size)
         {
@@ -239,7 +357,7 @@ namespace Salakhova_Sharp
             while (totalRead < size)
             {
                 int read = _socket.Receive(buffer, totalRead, size - totalRead, SocketFlags.None);
-                if (read == 0) return 0; // Соединение разорвано
+                if (read == 0) return 0;
                 totalRead += read;
             }
             return totalRead;
