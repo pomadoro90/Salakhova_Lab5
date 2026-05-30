@@ -14,6 +14,7 @@
 #include <mutex>
 #include <vector>
 #include <chrono>
+#include <set>
 
 #include "Salakhova_ThreadManager.h"
 #include "Salakhova_SysProgh.h"
@@ -34,6 +35,7 @@ constexpr int SERVER_TIMEOUT_SECONDS = 30;
 
 // Глобальный счетчик для выдачи ID клиентам
 int nextClientId = 1;
+set<int> freeIds;
 
 void BroadcastClientList()
 {
@@ -49,6 +51,7 @@ void BroadcastClientList()
         Message bcast(ADDR_SERVER, MT_CONFIRM, list);
         pair.second->addMessage(bcast);
     }
+    SafeWrite("BroadcastClientList: sent to", SRLocal::sessions_map.size(), "clients");
 }
 
 void ClientWorker(shared_ptr<tcp::socket> sock)
@@ -59,7 +62,13 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
 
     {
         lock_guard<mutex> lg(SRLocal::mx);
-        clientId = nextClientId++;
+        if (!freeIds.empty()) {
+            auto it = freeIds.begin();
+            clientId = *it;
+            freeIds.erase(it);
+        } else {
+            clientId = nextClientId++;
+        }
         Session* s = new Session(clientId, clientName);
         s->setSocket(sock);
         SRLocal::sessions_map[clientId] = s;
@@ -67,13 +76,14 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
 
     SafeWrite("Client", clientId, "connected.");
 
-    // Отправляем клиенту его собственный ID
+    // Ставим в очередь сообщение с ID клиента (отправится при следующем GETDATA)
     {
         Message idMsg(ADDR_SERVER, MT_CONFIRM, to_wstring(clientId));
         lock_guard<mutex> lg(SRLocal::mx);
         if (SRLocal::sessions_map.find(clientId) != SRLocal::sessions_map.end())
             SRLocal::sessions_map[clientId]->addMessage(idMsg);
     }
+    SafeWrite("Client", clientId, "assigned ID, queued MT_CONFIRM");
 
     try
     {
@@ -99,6 +109,7 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
                     {
                         // Есть сообщение — отправляем его клиенту
                         dataMsg.send(tr);
+                        SafeWrite("Server -> Client", clientId, "sent MT_DATA, from", dataMsg.header.from);
                     }
                     else
                     {
@@ -107,6 +118,12 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
                         noData.send(tr);
                     }
                 }
+            }
+            else if (m.header.messageType == MT_INFO)
+            {
+                lock_guard<mutex> lg(SRLocal::mx);
+                if (SRLocal::sessions_map.find(clientId) != SRLocal::sessions_map.end())
+                    SRLocal::sessions_map[clientId]->updateActivity();
             }
             else if (m.header.messageType == MT_DATA)
             {
@@ -142,7 +159,15 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
             }
         }
     }
-    catch (...) {}
+    catch (const boost::system::system_error& e) {
+        SafeWrite("Client", clientId, "connection error:", e.what());
+    }
+    catch (const std::exception& e) {
+        SafeWrite("Client", clientId, "error:", e.what());
+    }
+    catch (...) {
+        SafeWrite("Client", clientId, "unknown error.");
+    }
 
     SafeWrite("Client", clientId, "disconnected.");
     {
@@ -152,6 +177,7 @@ void ClientWorker(shared_ptr<tcp::socket> sock)
             SRLocal::sessions_map[clientId]->closeSocket();
             delete SRLocal::sessions_map[clientId];
             SRLocal::sessions_map.erase(clientId);
+            freeIds.insert(clientId);
         }
     }
 
@@ -192,6 +218,7 @@ void TimeoutMonitor()
                     SRLocal::sessions_map[id]->addMessage(closeMsg);
                     delete SRLocal::sessions_map[id];
                     SRLocal::sessions_map.erase(id);
+                    freeIds.insert(id);
                 }
             }
 
@@ -201,9 +228,24 @@ void TimeoutMonitor()
     }
 }
 
+// Блокируем закрытие консоли — чтобы потоки клиентов успели завершиться
+BOOL WINAPI ConsoleHandler(DWORD signal)
+{
+    if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT ||
+        signal == CTRL_CLOSE_EVENT || signal == CTRL_LOGOFF_EVENT || signal == CTRL_SHUTDOWN_EVENT)
+    {
+        SafeWrite("Server is shutting down. Press Ctrl+C again or close window to force.");
+        // Возвращаем TRUE чтобы заблокировать дефолтное закрытие
+        // Повторный Ctrl+C всё равно убьёт процесс
+        return TRUE;
+    }
+    return FALSE;
+}
+
 int main()
 {
     setlocale(LC_ALL, "Russian");
+    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
     SafeWrite("Message Broker Server started. Port: 12345");
 
     // Запускаем фоновый поток для проверки таймаутов

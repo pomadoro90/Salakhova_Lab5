@@ -11,8 +11,6 @@ SRLocal::SRLocal(int id) : id(id) {}
 
 void SRLocal::send(Message& m) const
 {
-    SafeWrite("SRLocal::send: messageType", m.header.messageType, "to", m.header.to, "from", m.header.from, "size", m.header.size);
-
     lock_guard<mutex> lg(mx); // �������� ������ � �������
     if (id < 0)
         sessions_map[m.header.to]->addMessage(m);

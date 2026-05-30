@@ -1,5 +1,4 @@
 #include "Salakhova_SocketTransport.h"
-#include "Salakhova_SysProgh.h"
 
 namespace ba = boost::asio;
 
@@ -8,8 +7,6 @@ SocketTransport::SocketTransport(boost::asio::ip::tcp::socket& s, std::mutex& mx
 
 void SocketTransport::send(Message& m) const
 {
-    SafeWrite("SocketTransport::send: messageType", m.header.messageType, "to", m.header.to, "from", m.header.from, "size", m.header.size);
-
     std::lock_guard<std::mutex> lg(writeMx);
 
     boost::system::error_code ec;
