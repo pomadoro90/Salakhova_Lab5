@@ -40,10 +40,10 @@ def main():
         nonlocal running
         while running and client.alive:
             try:
-                client._send_message(client.client_id, client.MT_GETDATA)
+                client._send_message(client.ADDR_SERVER, client.MT_GETDATA)
             except:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.5)
 
     def ping_loop():
         nonlocal running

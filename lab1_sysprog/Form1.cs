@@ -10,9 +10,7 @@ namespace Salakhova_Sharp
         private SalakhovaNetworkClient netClient = new SalakhovaNetworkClient();
 
         private System.Windows.Forms.Timer pollTimer;
-        private System.Windows.Forms.Timer pingTimer;
         private string clientName = "Client";
-
 
 
         public Form1()
@@ -27,13 +25,8 @@ namespace Salakhova_Sharp
 
             // Таймер пуллинга: каждые 50 мс забирает данные из очереди netClient
             pollTimer = new System.Windows.Forms.Timer();
-            pollTimer.Interval = 50;
+            pollTimer.Interval = 500;
             pollTimer.Tick += PollTimer_Tick;
-
-            // Таймер пинга (отправка регулярного MT_INFO для обновления активности)
-            pingTimer = new System.Windows.Forms.Timer();
-            pingTimer.Interval = 10000;
-            pingTimer.Tick += PingTimer_Tick;
 
             ToggleUi(false);
         }
@@ -53,7 +46,6 @@ namespace Salakhova_Sharp
             if (netClient.Connect("127.0.0.1", 12345, clientName))
             {
                 pollTimer.Start();
-                pingTimer.Start();
                 ToggleUi(true);
             }
             else
@@ -79,15 +71,6 @@ namespace Salakhova_Sharp
 
             txtOutput.AppendText($"[You -> {comboRecipient.SelectedItem}]: {textBoxMessage.Text}\r\n");
             textBoxMessage.Clear();
-        }
-
-        private void PingTimer_Tick(object sender, EventArgs e)
-        {
-            if (netClient.IsConnected)
-            {
-                // Отправляем пинг-сообщение (MT_INFO) на сервер
-                netClient.Send(MessageConstants.ADDR_SERVER, MessageTypes.MT_INFO, "");
-            }
         }
 
         // РЕАЛИЗАЦИЯ ПУЛЛИНГА:
@@ -119,7 +102,6 @@ namespace Salakhova_Sharp
             if (!netClient.IsConnected)
             {
                 pollTimer.Stop();
-                pingTimer.Stop();
                 ToggleUi(false);
                 MessageBox.Show("Connection to server lost!", "Disconnected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
@@ -164,7 +146,6 @@ namespace Salakhova_Sharp
             if (netClient.IsConnected)
             {
                 pollTimer.Stop();
-                pingTimer.Stop();
                 netClient.Disconnect();
                 ToggleUi(false);
                 comboRecipient.Items.Clear();
